@@ -1,0 +1,62 @@
+# --- 환경/시크릿 ---
+.env
+.env.local
+.env.*.local
+
+# --- Python ---
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+eggs/
+*.egg-info/
+*.egg
+
+# --- PyTorch / 모델 캐시 ---
+# 서비스에 필요한 YOLOv8 가중치(그림 종류 × 성별 8종)만 포함
+*.pt
+!image_to_json/*_weights/*/best.pt
+*.pth
+*.onnx
+.cache/
+huggingface/
+transformers_cache/
+
+# --- 데이터 / 벡터 DB (ChromaDB 등, 실행 시 생성) ---
+data/*.png
+image_to_json/result/
+image_to_json/uploads/
+jsonToLlm/results/
+jsonToLlm/htp_knowledge_base/
+chroma_db/
+chatbot/guide_chroma/
+*.sqlite3
+
+# --- OS ---
+.DS_Store
+Thumbs.db
+
+# --- IDE/에디터 ---
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# --- 테스트/coverage ---
+.coverage
+htmlcov/
+.pytest_cache/
+.mypy_cache/
+
+# --- 기타 ---
+*.log
+memo.txt
+

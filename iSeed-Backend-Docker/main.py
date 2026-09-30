@@ -1,0 +1,1336 @@
+
+import base64
+from datetime import datetime, timezone
+from pathlib import Path
+import os
+import urllib.parse
+
+from dotenv import load_dotenv
+
+import httpx
+from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile, status
+from fastapi.responses import RedirectResponse
+from pydantic import BaseModel
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from sqlalchemy import func
+from sqlalchemy.orm import Session
+
+from auth import (
+    create_jwt_token,
+    get_current_user_context,
+    get_optional_user_context,
+    hash_password,
+    verify_password,
+)
+from config import settings
+from db import get_db, init_db
+from mongo import close_mongo, init_mongo
+from user_mongo import (
+    ChildDoc,
+    UserDoc,
+    create_user,
+    find_user_by_email,
+    find_user_by_id,
+    next_sequence,
+)
+from analysis_mongo import (
+    AnalysisLog,
+    AnalysisSaveRequest,
+    DrawingAnalysis,
+    DrawingAnalysisSaveRequest,
+)
+from db_models import (
+    Child,
+    CommunityCategory,
+    CommunityComment,
+    CommunityPost,
+    CommunityPostBookmark,
+    CommunityPostImage,
+    CommunityPostLike,
+    CommunityPostTag,
+    CommunityTag,
+    ExpertProfile,
+    Post,
+    User,
+)
+from models import (
+    ChildCreateRequest,
+    CommunityCommentCreateRequest,
+    CommunityPostCreateRequest,
+    CommunityPostUpdateRequest,
+    LoginRequest,
+    PostCreateRequest,
+    PostUpdateRequest,
+    SignupRequest,
+)
+
+
+current_dir = Path(__file__).resolve().parent
+load_dotenv(current_dir / ".env")
+
+AIMODELS_BASE_URL = os.getenv("AIMODELS_BASE_URL", "http://localhost:8080")
+
+KAKAO_CLIENT_ID = os.getenv("KAKAO_CLIENT_ID", "")
+KAKAO_CLIENT_SECRET = os.getenv("KAKAO_CLIENT_SECRET", "")
+KAKAO_REDIRECT_URI = os.getenv(
+    "KAKAO_REDIRECT_URI",
+    "http://localhost:8000/auth/kakao/callback",
+)
+GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")
+GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", "")
+GOOGLE_REDIRECT_URI = os.getenv(
+    "GOOGLE_REDIRECT_URI",
+    "http://localhost:8000/auth/google/callback",
+)
+FRONTEND_BASE_URL = os.getenv("FRONTEND_BASE_URL", "http://localhost:3000")
+
+
+class ChatbotRequest(BaseModel):
+    question: str
+    analysis_context: dict | None = None
+
+
+class ChatbotResponse(BaseModel):
+    question: str
+    answer: str
+from utils import (
+    serialize_community_comment,
+    serialize_community_post,
+    serialize_community_posts,
+    serialize_post,
+    serialize_posts,
+)
+from s3_storage import (
+    upload_profile_image_to_s3,
+    upload_analysis_box_image_to_s3,
+)
+
+app = FastAPI()
+
+STATIC_DIR = Path(__file__).resolve().parent / "static"
+app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
+_allowed_origins = list({
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+    FRONTEND_BASE_URL,
+})
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_allowed_origins,
+    allow_origin_regex=r"^http://(localhost|127\.0\.0\.1)(:\d+)?$",
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+@app.get("/health")
+def health_check():
+    """Docker health check endpoint"""
+    return {"status": "healthy"}
+
+
+@app.on_event("startup")
+def on_startup():
+    # iSeed: 외부 MySQL이 없거나 접속 불가여도 서버는 기동되도록 방어.
+    # (그림 분석 → 리포트 → 마음활동 핵심 플로우는 DB 없이 동작합니다.)
+    try:
+        init_db()
+    except Exception as e:
+        print(f"[startup] MySQL 초기화 실패 - DB 기능 비활성화로 계속 진행합니다: {e}")
+
+
+@app.on_event("startup")
+async def on_startup_mongo():
+    try:
+        if not settings.mongodb_uri:
+            print("[startup] MONGODB_URI 미설정 - 분석 기록 저장 기능 비활성화")
+            return
+        await init_mongo()
+    except Exception as e:
+        print(f"[startup] MongoDB 초기화 실패 - 기록 저장 기능 비활성화로 계속 진행합니다: {e}")
+
+
+@app.on_event("shutdown")
+async def on_shutdown_mongo():
+    await close_mongo()
+
+
+@app.post("/chatbot", response_model=ChatbotResponse)
+async def chatbot_proxy(payload: ChatbotRequest):
+    question = payload.question.strip()
+    if not question:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail={"message": "질문을 입력해 주세요."})
+
+    request_body = {"question": question}
+    if payload.analysis_context:
+        request_body["analysis_context"] = payload.analysis_context
+
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            response = await client.post(
+                f"{AIMODELS_BASE_URL}/chatbot",
+                json=request_body,
+            )
+        response.raise_for_status()
+    except httpx.RequestError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail={"message": "챗봇 서버에 연결할 수 없습니다.", "error": str(exc)},
+        )
+    except httpx.HTTPStatusError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail={
+                "message": f"챗봇 서버 오류: {exc.response.status_code}",
+                "body": exc.response.text,
+            },
+        )
+
+    try:
+        data = response.json()
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail={"message": "챗봇 응답이 JSON이 아닙니다.", "body": response.text},
+        )
+
+    answer = data.get("answer")
+    if not answer:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail={"message": "챗봇 응답이 올바르지 않습니다.", "body": data},
+        )
+
+    return ChatbotResponse(question=question, answer=answer)
+
+
+# --- AI 분석 로그 (MongoDB) ---
+
+
+@app.post("/analysis/save", status_code=status.HTTP_201_CREATED)
+async def analysis_save(payload: AnalysisSaveRequest):
+    """AI 그림 해석 결과 JSON을 MongoDB analysis_logs에 저장 (image_to_json, jsonToLlm 결과)."""
+    log = AnalysisLog(
+        user_id=payload.user_id,
+        image_to_json=payload.image_to_json,
+        json_to_llm_json=payload.json_to_llm_json,
+        llm_result_text=payload.llm_result_text,
+    )
+    await log.insert()
+    return {
+        "id": str(log.id),
+        "user_id": log.user_id,
+        "created_at": log.created_at.isoformat(),
+    }
+
+
+@app.get("/analysis/{user_id}")
+async def get_analysis_logs(user_id: int):
+    """특정 유저의 분석 기록 목록 (최신순). [레거시] analysis_logs"""
+    logs = (
+        await AnalysisLog.find(AnalysisLog.user_id == user_id)
+        .sort([("created_at", -1)])
+        .to_list()
+    )
+    return [
+        {
+            "id": str(doc.id),
+            "user_id": doc.user_id,
+            "created_at": doc.created_at.isoformat(),
+            "image_to_json": doc.image_to_json,
+            "json_to_llm_json": doc.json_to_llm_json,
+            "llm_result_text": doc.llm_result_text,
+        }
+        for doc in logs
+    ]
+
+
+# --- 그림 분석 저장 (drawing_analyses: 요소분석 + S3 이미지 + 심리해석) ---
+
+
+@app.post("/drawing-analyses", status_code=status.HTTP_201_CREATED)
+async def create_drawing_analysis(payload: DrawingAnalysisSaveRequest):
+    """그림 분석 1건 저장. element_analysis(image_json+features)를 MongoDB에 저장. S3 업로드는 실패해도 DB 저장 진행."""
+    analyzed_urls = {}
+    for key in ("tree", "house", "man", "woman"):
+        b64 = payload.box_images_base64.get(key)
+        if b64:
+            try:
+                url = await upload_analysis_box_image_to_s3(
+                    b64, payload.user_id, key
+                )
+                if url:
+                    analyzed_urls[key] = url
+            except Exception:
+                pass  # S3 실패해도 element_analysis는 DB에 저장
+    doc = DrawingAnalysis(
+        user_id=payload.user_id,
+        child_info=payload.child_info,
+        element_analysis=payload.element_analysis,
+        analyzed_image_urls=analyzed_urls,
+        psychological_interpretation=payload.psychological_interpretation,
+        comparison=payload.comparison,
+        recommendations=getattr(payload, "recommendations", []) or [],
+        overall_psychology_result=getattr(payload, "overall_psychology_result", {}) or {},
+    )
+    await doc.insert()
+    return {
+        "id": str(doc.id),
+        "user_id": doc.user_id,
+        "created_at": doc.created_at.isoformat(),
+    }
+
+
+@app.get("/drawing-analyses")
+async def list_drawing_analyses(
+    user_id: int,
+    context=Depends(get_current_user_context),
+):
+    """내 그림 분석 목록 (최신순). 인증된 유저만 본인 것 조회."""
+    if context["user"].id != user_id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN)
+    docs = (
+        await DrawingAnalysis.find(DrawingAnalysis.user_id == user_id)
+        .sort([("created_at", -1)])
+        .to_list()
+    )
+    return [
+        {
+            "id": str(d.id),
+            "user_id": d.user_id,
+            "child_info": d.child_info,
+            "created_at": d.created_at.isoformat(),
+            "element_analysis": d.element_analysis,
+            "analyzed_image_urls": d.analyzed_image_urls,
+            "psychological_interpretation": d.psychological_interpretation,
+            "comparison": d.comparison,
+            "recommendations": getattr(d, "recommendations", []) or [],
+            "전체_심리_결과": getattr(d, "overall_psychology_result", {}) or {},
+        }
+        for d in docs
+    ]
+
+
+def _normalize_gender_for_score(value: str | None) -> str:
+    v = (value or "").strip().lower()
+    if v in {"male", "m", "남", "남아"}:
+        return "남"
+    if v in {"female", "f", "여", "여아"}:
+        return "여"
+    return ""
+
+
+def _get_image_json_from_element(v: dict) -> dict | None:
+    """element_analysis 값이 { image_json, legacy_json } 형태이면 image_json만 반환, 아니면 v 자체."""
+    if not v or not isinstance(v, dict):
+        return None
+    if "image_json" in v:
+        return v.get("image_json") if isinstance(v.get("image_json"), dict) else None
+    return v
+
+
+async def _call_aimodels_analyze_score(
+    element_analysis: dict,
+    child_info: dict,
+) -> dict | None:
+    """DB의 element_analysis로 AiModels /analyze/score 호출 → T-Score 반환."""
+    results = {}
+    for k in ("tree", "house", "man", "woman"):
+        v = (element_analysis or {}).get(k)
+        img = _get_image_json_from_element(v) if isinstance(v, dict) else (v if isinstance(v, dict) else None)
+        if img:
+            results[k] = {"image_json": img}
+    if not results:
+        return None
+    try:
+        age_raw = child_info.get("age") or child_info.get("나이") or "0"
+        age = int(age_raw) if str(age_raw).isdigit() else 0
+        age = max(7, min(13, age)) if age else 8
+        gender = _normalize_gender_for_score(
+            child_info.get("gender") or child_info.get("성별") or ""
+        )
+        if not gender:
+            return None
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.post(
+                f"{AIMODELS_BASE_URL}/analyze/score",
+                json={"results": results, "age": age, "gender": gender},
+            )
+        if resp.status_code != 200:
+            return None
+        return resp.json()
+    except Exception:
+        return None
+
+
+@app.get("/drawing-analyses/{analysis_id}")
+async def get_drawing_analysis(
+    analysis_id: str,
+    context=Depends(get_current_user_context),
+):
+    """그림 분석 1건 상세 조회. DB의 element_analysis로 T-Score 재계산 후 comparison에 반영."""
+    from beanie import PydanticObjectId
+    try:
+        oid = PydanticObjectId(analysis_id)
+    except Exception:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
+    doc = await DrawingAnalysis.get(oid)
+    if not doc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
+    if doc.user_id != context["user"].id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN)
+
+    comparison = dict(doc.comparison or {})
+
+    drawing_scores = await _call_aimodels_analyze_score(
+        doc.element_analysis or {},
+        doc.child_info or {},
+    )
+    if drawing_scores:
+        comparison["drawing_scores"] = drawing_scores
+
+    return {
+        "id": str(doc.id),
+        "user_id": doc.user_id,
+        "child_info": doc.child_info,
+        "created_at": doc.created_at.isoformat(),
+        "element_analysis": doc.element_analysis,
+        "analyzed_image_urls": doc.analyzed_image_urls,
+        "psychological_interpretation": doc.psychological_interpretation,
+        "comparison": comparison,
+        "recommendations": getattr(doc, "recommendations", []) or [],
+        "전체_심리_결과": getattr(doc, "overall_psychology_result", {}) or {},
+    }
+
+
+@app.post("/auth/signup", status_code=status.HTTP_201_CREATED)
+async def signup(payload: SignupRequest):
+    found = await find_user_by_email(payload.email)
+    if found:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"message": "회원이 있습니다!"},
+        )
+
+    user = await create_user(
+        name=payload.name,
+        email=payload.email,
+        password_hash=hash_password(payload.password),
+        profile_image_url="base",
+        agree_terms=payload.agree_terms,
+        agree_privacy=payload.agree_privacy,
+        agree_marketing=payload.agree_marketing,
+    )
+
+    token = create_jwt_token(str(user.user_id))
+    return {"token": token, "email": user.email}
+
+
+@app.post("/auth/login")
+async def login(payload: LoginRequest):
+    user = await find_user_by_email(payload.email)
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail={"message": "회원정보가 없습니다!"},
+        )
+
+    if not verify_password(payload.password, user.password):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail={"message": "비밀번호를 확인하세요!"},
+        )
+
+    token = create_jwt_token(str(user.user_id))
+    return {"token": token, "email": payload.email}
+
+
+@app.get("/auth/kakao/login")
+def kakao_login():
+    """카카오 로그인 시작: 카카오 OAuth 인가 페이지로 리다이렉트."""
+    if not KAKAO_CLIENT_ID:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail={"message": "KAKAO_CLIENT_ID가 설정되지 않았습니다."},
+        )
+
+    params = {
+        "client_id": KAKAO_CLIENT_ID,
+        "redirect_uri": KAKAO_REDIRECT_URI,
+        "response_type": "code",
+        "scope": "account_email profile_nickname",  # 이메일과 닉네임 동의 요청 (카카오 개발자 콘솔에서 동의 항목 활성화 필요)
+        "prompt": "consent",  # 매번 동의 화면 표시 (이미 동의한 사용자에게도)
+    }
+    url = "https://kauth.kakao.com/oauth/authorize?" + urllib.parse.urlencode(params)
+    return RedirectResponse(url)
+
+
+@app.get("/auth/kakao/callback")
+async def kakao_callback(code: str):
+    """카카오 OAuth 콜백: 토큰/유저 정보 조회 후 우리 서비스 토큰 발급."""
+    if not code:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"message": "인가 코드가 없습니다."},
+        )
+    if not KAKAO_CLIENT_ID:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail={"message": "KAKAO_CLIENT_ID가 설정되지 않았습니다."},
+        )
+
+    # 1) 인가 코드로 카카오 액세스 토큰 발급
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            data = {
+                "grant_type": "authorization_code",
+                "client_id": KAKAO_CLIENT_ID,
+                "redirect_uri": KAKAO_REDIRECT_URI,
+                "code": code,
+            }
+            if KAKAO_CLIENT_SECRET:
+                data["client_secret"] = KAKAO_CLIENT_SECRET
+
+            token_res = await client.post(
+                "https://kauth.kakao.com/oauth/token",
+                data=data,
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+            )
+        token_res.raise_for_status()
+        token_data = token_res.json()
+    except httpx.HTTPError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail={"message": "카카오 토큰 발급에 실패했습니다.", "error": str(exc)},
+        )
+
+    access_token = token_data.get("access_token")
+    if not access_token:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail={"message": "카카오 액세스 토큰이 없습니다.", "body": token_data},
+        )
+
+    # 2) 액세스 토큰으로 카카오 사용자 정보 조회
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            user_res = await client.get(
+                "https://kapi.kakao.com/v2/user/me",
+                headers={"Authorization": f"Bearer {access_token}"},
+            )
+        user_res.raise_for_status()
+        kakao_user = user_res.json()
+    except httpx.HTTPError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail={"message": "카카오 사용자 정보 조회에 실패했습니다.", "error": str(exc)},
+        )
+
+    kakao_id = kakao_user.get("id")
+    kakao_account = kakao_user.get("kakao_account") or {}
+    profile = kakao_account.get("profile") or {}
+    
+    # 카카오에서 제공하는 이메일, 닉네임, 프로필 이미지 가져오기
+    email = kakao_account.get("email")
+    name = profile.get("nickname") or kakao_account.get("name") or "카카오 사용자"
+    profile_image_url = profile.get("profile_image_url") or profile.get("thumbnail_image_url") or "base"
+    
+    # 이메일이 없거나 동의하지 않은 경우 처리
+    if not email:
+        if not kakao_id:
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail={"message": "카카오 응답에 id가 없습니다.", "body": kakao_user},
+            )
+        # 이메일 동의를 하지 않은 경우, 카카오 ID 기반 이메일 생성
+        # (실제 서비스에서는 이메일 동의를 필수로 요청하는 것이 좋습니다)
+        email = f"kakao_{kakao_id}@example.com"
+
+    # 3) 우리 서비스 유저 조회/생성 (MongoDB)
+    user = await get_or_create_social_user(name=name, email=email, profile_image_url=profile_image_url)
+
+    # 4) 기존 로직과 동일한 JWT 발급
+    token = create_jwt_token(str(user.user_id))
+
+    # 5) 프론트엔드 콜백 페이지로 리다이렉트 (토큰/이메일 전달)
+    query = {
+        "token": token,
+        "email": email,
+    }
+    redirect_url = f"{FRONTEND_BASE_URL.rstrip('/')}/login/kakao-callback?{urllib.parse.urlencode(query)}"
+    return RedirectResponse(redirect_url)
+
+
+@app.get("/auth/google/login")
+def google_login():
+    """구글 로그인 시작: 구글 OAuth 인가 페이지로 리다이렉트."""
+    if not GOOGLE_CLIENT_ID:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail={"message": "GOOGLE_CLIENT_ID가 설정되지 않았습니다."},
+        )
+
+    params = {
+        "client_id": GOOGLE_CLIENT_ID,
+        "redirect_uri": GOOGLE_REDIRECT_URI,
+        "response_type": "code",
+        "scope": "openid email profile",  # 이메일, 프로필 정보 요청
+        "access_type": "offline",  # refresh token 받기 위해
+        "prompt": "consent",  # 동의 화면 표시
+    }
+    url = "https://accounts.google.com/o/oauth2/v2/auth?" + urllib.parse.urlencode(params)
+    return RedirectResponse(url)
+
+
+@app.get("/auth/google/callback")
+async def google_callback(code: str):
+    """구글 OAuth 콜백: 토큰/유저 정보 조회 후 우리 서비스 토큰 발급."""
+    if not code:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"message": "인가 코드가 없습니다."},
+        )
+    if not GOOGLE_CLIENT_ID:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail={"message": "GOOGLE_CLIENT_ID가 설정되지 않았습니다."},
+        )
+
+    # 1) 인가 코드로 구글 액세스 토큰 발급
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            data = {
+                "code": code,
+                "client_id": GOOGLE_CLIENT_ID,
+                "client_secret": GOOGLE_CLIENT_SECRET,
+                "redirect_uri": GOOGLE_REDIRECT_URI,
+                "grant_type": "authorization_code",
+            }
+
+            token_res = await client.post(
+                "https://oauth2.googleapis.com/token",
+                data=data,
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+            )
+        token_res.raise_for_status()
+        token_data = token_res.json()
+    except httpx.HTTPError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail={"message": "구글 토큰 발급에 실패했습니다.", "error": str(exc)},
+        )
+
+    access_token = token_data.get("access_token")
+    if not access_token:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail={"message": "구글 액세스 토큰이 없습니다.", "body": token_data},
+        )
+
+    # 2) 액세스 토큰으로 구글 사용자 정보 조회
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            user_res = await client.get(
+                "https://www.googleapis.com/oauth2/v3/userinfo",
+                headers={"Authorization": f"Bearer {access_token}"},
+            )
+        user_res.raise_for_status()
+        google_user = user_res.json()
+    except httpx.HTTPError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail={"message": "구글 사용자 정보 조회에 실패했습니다.", "error": str(exc)},
+        )
+
+    google_id = google_user.get("sub")  # 구글은 "sub" 필드에 사용자 ID
+    email = google_user.get("email")
+    name = google_user.get("name") or google_user.get("given_name") or "구글 사용자"
+    profile_image_url = google_user.get("picture") or "base"
+
+    # 이메일이 없는 경우 처리 (구글은 보통 이메일을 제공하지만 안전장치)
+    if not email:
+        if not google_id:
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail={"message": "구글 응답에 id/email이 없습니다.", "body": google_user},
+            )
+        email = f"google_{google_id}@example.com"
+
+    # 3) 우리 서비스 유저 조회/생성 (MongoDB)
+    user = await get_or_create_social_user(name=name, email=email, profile_image_url=profile_image_url)
+
+    # 4) 기존 로직과 동일한 JWT 발급
+    token = create_jwt_token(str(user.user_id))
+
+    # 5) 프론트엔드 콜백 페이지로 리다이렉트 (토큰/이메일 전달)
+    query = {
+        "token": token,
+        "email": email,
+    }
+    redirect_url = f"{FRONTEND_BASE_URL.rstrip('/')}/login/google-callback?{urllib.parse.urlencode(query)}"
+    return RedirectResponse(redirect_url)
+
+
+@app.post("/auth/me")
+def me(context=Depends(get_current_user_context)):
+    user = context["user"]
+    return {
+        "token": context["token"],
+        "id": user.id,
+        "email": user.email,
+        "name": user.name,
+        "profile_image_url": _resolve_profile_image_url(user.profile_image_url),
+        "created_at": user.created_at,
+    }
+
+
+# --- 아이(children) API ---
+
+
+@app.get("/children")
+async def get_my_children(context=Depends(get_current_user_context)):
+    """내가 등록한 아이 목록"""
+    children = (
+        await ChildDoc.find(ChildDoc.user_id == context["user"].id)
+        .sort(-ChildDoc.created_at)
+        .to_list()
+    )
+    return [_serialize_child(c) for c in children]
+
+
+@app.post("/children", status_code=status.HTTP_201_CREATED)
+async def create_child(
+    payload: ChildCreateRequest,
+    context=Depends(get_current_user_context),
+):
+    """아이 등록"""
+    child = ChildDoc(
+        child_id=await next_sequence("children"),
+        user_id=context["user"].id,
+        name=payload.name,
+        age=payload.age,
+        gender=payload.gender,
+    )
+    await child.insert()
+    return _serialize_child(child)
+
+
+def _serialize_child(c: ChildDoc) -> dict:
+    return {
+        "id": c.child_id,
+        "name": c.name,
+        "age": c.age,
+        "gender": c.gender,
+        "created_at": c.created_at.isoformat() if c.created_at else None,
+    }
+
+
+async def get_or_create_social_user(*, name: str, email: str, profile_image_url: str) -> UserDoc:
+    """카카오/구글 로그인 사용자 조회 또는 생성 (랜덤 비밀번호)."""
+    user = await find_user_by_email(email)
+    if not user:
+        random_password = base64.b64encode(os.urandom(18)).decode("ascii")
+        return await create_user(
+            name=name,
+            email=email,
+            password_hash=hash_password(random_password),
+            profile_image_url=profile_image_url,
+            agree_terms=True,
+            agree_privacy=True,
+            agree_marketing=False,
+        )
+    # 기존 유저: 소셜 프로필 사진이 있고, 아직 기본값이면 업데이트
+    if profile_image_url != "base" and (not user.profile_image_url or user.profile_image_url == "base"):
+        user.profile_image_url = profile_image_url
+        user.updated_at = datetime.now(timezone.utc)
+        await user.save()
+    return user
+
+
+@app.put("/users/me/profile-image")
+async def update_profile_image(
+    image: UploadFile = File(...),
+    context=Depends(get_current_user_context),
+):
+    user = context["user"]
+    image_url = await upload_profile_image_to_s3(image, user.id)
+    doc = await find_user_by_id(user.id)
+    if doc:
+        doc.profile_image_url = image_url
+        doc.updated_at = datetime.now(timezone.utc)
+        await doc.save()
+    return {"profile_image_url": _resolve_profile_image_url(image_url)}
+
+
+def _resolve_profile_image_url(value: str | None) -> str | None:
+    if not value or value == "base":
+        return "/static/profile-default.svg"
+    return value
+
+
+@app.get("/post")
+def get_posts(
+    email: str | None = None,
+    context=Depends(get_current_user_context),
+    db: Session = Depends(get_db),
+):
+    query = db.query(Post)
+    if email:
+        query = query.filter(Post.userid == email)
+    data = query.order_by(Post.createdAt.desc()).all()
+    return serialize_posts(data)
+
+
+@app.get("/post/{post_id}")
+def get_post(
+    post_id: str,
+    context=Depends(get_current_user_context),
+    db: Session = Depends(get_db),
+):
+    try:
+        post_id_int = int(post_id)
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"message": f"{post_id}의 포스트가 없습니다"},
+        )
+    post = db.query(Post).filter(Post.id == post_id_int).first()
+    if not post:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"message": f"{post_id}의 포스트가 없습니다"},
+        )
+    return serialize_post(post)
+
+
+@app.post("/post", status_code=status.HTTP_201_CREATED)
+def create_post(
+    payload: PostCreateRequest,
+    context=Depends(get_current_user_context),
+    db: Session = Depends(get_db),
+):
+    user = context["user"]
+    now = datetime.utcnow()
+    post = Post(
+        text=payload.text,
+        userIdx=user.id,
+        name=user.name,
+        userid=user.email,
+        createdAt=now,
+        updatedAt=now,
+    )
+    db.add(post)
+    db.commit()
+    db.refresh(post)
+    return serialize_post(post)
+
+
+@app.put("/post/{post_id}")
+def update_post(
+    post_id: str,
+    payload: PostUpdateRequest,
+    context=Depends(get_current_user_context),
+    db: Session = Depends(get_db),
+):
+    user = context["user"]
+    try:
+        post_id_int = int(post_id)
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"message": f"{post_id}에 대한 포스트가 없습니다"},
+        )
+    existing = db.query(Post).filter(Post.id == post_id_int).first()
+    if not existing:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"message": f"{post_id}에 대한 포스트가 없습니다"},
+        )
+    if existing.userIdx != user.id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN)
+
+    existing.text = payload.text
+    existing.updatedAt = datetime.utcnow()
+    db.commit()
+    db.refresh(existing)
+    return serialize_post(existing)
+
+
+@app.delete("/post/{post_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_post(
+    post_id: str,
+    context=Depends(get_current_user_context),
+    db: Session = Depends(get_db),
+):
+    user = context["user"]
+    try:
+        post_id_int = int(post_id)
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"message": f"{post_id}에 대한 포스트가 없습니다"},
+        )
+    existing = db.query(Post).filter(Post.id == post_id_int).first()
+    if not existing:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"message": f"{post_id}에 대한 포스트가 없습니다"},
+        )
+    if existing.userIdx != user.id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN)
+    db.delete(existing)
+    db.commit()
+    return None
+
+
+@app.get("/community/categories")
+def get_community_categories(db: Session = Depends(get_db)):
+    categories = (
+        db.query(CommunityCategory)
+        .order_by(CommunityCategory.sort_order.asc(), CommunityCategory.id.asc())
+        .all()
+    )
+    return [
+        {
+            "id": category.id,
+            "slug": category.slug,
+            "label": category.label,
+            "sort_order": category.sort_order,
+        }
+        for category in categories
+    ]
+
+
+@app.get("/community/experts")
+def get_community_experts(db: Session = Depends(get_db)):
+    experts = (
+        db.query(ExpertProfile, User)
+        .join(User, User.id == ExpertProfile.user_id)
+        .order_by(ExpertProfile.answer_count.desc())
+        .all()
+    )
+    return [
+        {
+            "user_id": expert.user_id,
+            "name": user.name,
+            "title": expert.title,
+            "answer_count": expert.answer_count,
+        }
+        for expert, user in experts
+    ]
+
+
+@app.get("/community/stats")
+def get_community_stats(db: Session = Depends(get_db)):
+    users_count = db.query(func.count(User.id)).scalar() or 0
+    posts_count = db.query(func.count(CommunityPost.id)).scalar() or 0
+    comments_count = db.query(func.count(CommunityComment.id)).scalar() or 0
+    experts_count = db.query(func.count(ExpertProfile.user_id)).scalar() or 0
+    return {
+        "users": users_count,
+        "posts": posts_count,
+        "comments": comments_count,
+        "experts": experts_count,
+    }
+
+
+@app.get("/community/posts")
+def get_community_posts(
+    category: str | None = None,
+    search: str | None = None,
+    sort: str = "latest",
+    page: int = 1,
+    page_size: int = 10,
+    context=Depends(get_optional_user_context),
+    db: Session = Depends(get_db),
+):
+    query = db.query(CommunityPost).join(CommunityCategory)
+    if category and category != "all":
+        query = query.filter(CommunityCategory.slug == category)
+    if search:
+        keyword = f"%{search}%"
+        query = query.filter(
+            (CommunityPost.title.like(keyword)) | (CommunityPost.content.like(keyword))
+        )
+
+    if sort in {"view_count", "views"}:
+        query = query.order_by(
+            CommunityPost.view_count.desc(),
+            CommunityPost.created_at.desc(),
+        )
+    elif sort in {"like_count", "likes"}:
+        query = query.order_by(
+            CommunityPost.like_count.desc(),
+            CommunityPost.created_at.desc(),
+        )
+    elif sort == "popular":
+        query = query.order_by(
+            CommunityPost.like_count.desc(),
+            CommunityPost.view_count.desc(),
+            CommunityPost.created_at.desc(),
+        )
+    else:
+        query = query.order_by(CommunityPost.created_at.desc())
+
+    total = query.with_entities(func.count(CommunityPost.id)).scalar() or 0
+    page = max(page, 1)
+    page_size = min(max(page_size, 1), 50)
+    offset = (page - 1) * page_size
+
+    posts = query.offset(offset).limit(page_size).all()
+    current_user_id = context["user"].id if context.get("user") else None
+    return {
+        "items": serialize_community_posts(posts, current_user_id),
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+    }
+
+
+@app.get("/community/posts/{post_id}")
+def get_community_post(
+    post_id: int,
+    context=Depends(get_optional_user_context),
+    db: Session = Depends(get_db),
+):
+    post = db.query(CommunityPost).filter(CommunityPost.id == post_id).first()
+    if not post:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"message": f"{post_id}의 게시글이 없습니다"},
+        )
+    post.view_count += 1
+    db.commit()
+    db.refresh(post)
+    current_user_id = context["user"].id if context.get("user") else None
+    return serialize_community_post(post, current_user_id)
+
+
+@app.post("/community/posts", status_code=status.HTTP_201_CREATED)
+def create_community_post(
+    payload: CommunityPostCreateRequest,
+    context=Depends(get_current_user_context),
+    db: Session = Depends(get_db),
+):
+    category = (
+        db.query(CommunityCategory)
+        .filter(CommunityCategory.slug == payload.category_slug)
+        .first()
+    )
+    if not category:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"message": "유효하지 않은 카테고리입니다"},
+        )
+
+    now = datetime.utcnow()
+    post = CommunityPost(
+        user_id=context["user"].id,
+        category_id=category.id,
+        title=payload.title,
+        content=payload.content,
+        created_at=now,
+        updated_at=now,
+    )
+    db.add(post)
+    db.flush()
+
+    for index, image_url in enumerate(payload.images or []):
+        db.add(
+            CommunityPostImage(
+                post_id=post.id,
+                image_url=image_url,
+                sort_order=index,
+                created_at=now,
+            )
+        )
+
+    for tag_name in payload.tags or []:
+        normalized = tag_name.strip().lstrip("#")
+        if not normalized:
+            continue
+        tag = db.query(CommunityTag).filter(CommunityTag.name == normalized).first()
+        if not tag:
+            tag = CommunityTag(name=normalized, created_at=now)
+            db.add(tag)
+            db.flush()
+        db.add(
+            CommunityPostTag(
+                post_id=post.id,
+                tag_id=tag.id,
+                created_at=now,
+            )
+        )
+
+    db.commit()
+    db.refresh(post)
+    return serialize_community_post(post, context["user"].id)
+
+
+@app.put("/community/posts/{post_id}")
+def update_community_post(
+    post_id: int,
+    payload: CommunityPostUpdateRequest,
+    context=Depends(get_current_user_context),
+    db: Session = Depends(get_db),
+):
+    post = db.query(CommunityPost).filter(CommunityPost.id == post_id).first()
+    if not post:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"message": f"{post_id}의 게시글이 없습니다"},
+        )
+    if post.user_id != context["user"].id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN)
+
+    if payload.category_slug:
+        category = (
+            db.query(CommunityCategory)
+            .filter(CommunityCategory.slug == payload.category_slug)
+            .first()
+        )
+        if not category:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={"message": "유효하지 않은 카테고리입니다"},
+            )
+        post.category_id = category.id
+
+    if payload.title is not None:
+        post.title = payload.title
+    if payload.content is not None:
+        post.content = payload.content
+    post.updated_at = datetime.utcnow()
+
+    if payload.images is not None:
+        db.query(CommunityPostImage).filter(
+            CommunityPostImage.post_id == post.id
+        ).delete()
+        for index, image_url in enumerate(payload.images):
+            db.add(
+                CommunityPostImage(
+                    post_id=post.id,
+                    image_url=image_url,
+                    sort_order=index,
+                    created_at=post.updated_at,
+                )
+            )
+
+    if payload.tags is not None:
+        db.query(CommunityPostTag).filter(
+            CommunityPostTag.post_id == post.id
+        ).delete()
+        for tag_name in payload.tags:
+            normalized = tag_name.strip().lstrip("#")
+            if not normalized:
+                continue
+            tag = (
+                db.query(CommunityTag).filter(CommunityTag.name == normalized).first()
+            )
+            if not tag:
+                tag = CommunityTag(name=normalized, created_at=post.updated_at)
+                db.add(tag)
+                db.flush()
+            db.add(
+                CommunityPostTag(
+                    post_id=post.id,
+                    tag_id=tag.id,
+                    created_at=post.updated_at,
+                )
+            )
+
+    db.commit()
+    db.refresh(post)
+    return serialize_community_post(post, context["user"].id)
+
+
+@app.delete("/community/posts/{post_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_community_post(
+    post_id: int,
+    context=Depends(get_current_user_context),
+    db: Session = Depends(get_db),
+):
+    post = db.query(CommunityPost).filter(CommunityPost.id == post_id).first()
+    if not post:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"message": f"{post_id}의 게시글이 없습니다"},
+        )
+    if post.user_id != context["user"].id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN)
+
+    db.query(CommunityPostImage).filter(
+        CommunityPostImage.post_id == post.id
+    ).delete()
+    db.query(CommunityPostTag).filter(CommunityPostTag.post_id == post.id).delete()
+    db.query(CommunityComment).filter(CommunityComment.post_id == post.id).delete()
+    db.query(CommunityPostLike).filter(CommunityPostLike.post_id == post.id).delete()
+    db.query(CommunityPostBookmark).filter(
+        CommunityPostBookmark.post_id == post.id
+    ).delete()
+    db.delete(post)
+    db.commit()
+    return None
+
+
+@app.get("/community/posts/{post_id}/comments")
+def get_community_comments(
+    post_id: int,
+    db: Session = Depends(get_db),
+):
+    comments = (
+        db.query(CommunityComment)
+        .filter(CommunityComment.post_id == post_id)
+        .order_by(CommunityComment.created_at.asc())
+        .all()
+    )
+    return [serialize_community_comment(comment) for comment in comments]
+
+
+@app.post("/community/posts/{post_id}/comments", status_code=status.HTTP_201_CREATED)
+def create_community_comment(
+    post_id: int,
+    payload: CommunityCommentCreateRequest,
+    context=Depends(get_current_user_context),
+    db: Session = Depends(get_db),
+):
+    post = db.query(CommunityPost).filter(CommunityPost.id == post_id).first()
+    if not post:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"message": f"{post_id}의 게시글이 없습니다"},
+        )
+
+    if payload.parent_id:
+        parent = (
+            db.query(CommunityComment)
+            .filter(
+                CommunityComment.id == payload.parent_id,
+                CommunityComment.post_id == post_id,
+            )
+            .first()
+        )
+        if not parent:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={"message": "유효하지 않은 부모 댓글입니다"},
+            )
+
+    now = datetime.utcnow()
+    comment = CommunityComment(
+        post_id=post_id,
+        user_id=context["user"].id,
+        parent_id=payload.parent_id,
+        content=payload.content,
+        created_at=now,
+        updated_at=now,
+    )
+    db.add(comment)
+    post.comment_count += 1
+    db.commit()
+    db.refresh(comment)
+    return serialize_community_comment(comment)
+
+
+@app.delete("/community/comments/{comment_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_community_comment(
+    comment_id: int,
+    context=Depends(get_current_user_context),
+    db: Session = Depends(get_db),
+):
+    comment = (
+        db.query(CommunityComment).filter(CommunityComment.id == comment_id).first()
+    )
+    if not comment:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"message": "댓글이 없습니다"},
+        )
+    if comment.user_id != context["user"].id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN)
+
+    post = db.query(CommunityPost).filter(CommunityPost.id == comment.post_id).first()
+    db.delete(comment)
+    if post and post.comment_count > 0:
+        post.comment_count -= 1
+    db.commit()
+    return None
+
+
+@app.post("/community/posts/{post_id}/like")
+def toggle_community_like(
+    post_id: int,
+    context=Depends(get_current_user_context),
+    db: Session = Depends(get_db),
+):
+    post = db.query(CommunityPost).filter(CommunityPost.id == post_id).first()
+    if not post:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"message": f"{post_id}의 게시글이 없습니다"},
+        )
+    existing = (
+        db.query(CommunityPostLike)
+        .filter(
+            CommunityPostLike.post_id == post_id,
+            CommunityPostLike.user_id == context["user"].id,
+        )
+        .first()
+    )
+    if existing:
+        db.delete(existing)
+        if post.like_count > 0:
+            post.like_count -= 1
+        is_liked = False
+    else:
+        db.add(
+            CommunityPostLike(
+                post_id=post_id,
+                user_id=context["user"].id,
+                created_at=datetime.utcnow(),
+            )
+        )
+        post.like_count += 1
+        is_liked = True
+    db.commit()
+    return {"post_id": post_id, "is_liked": is_liked, "like_count": post.like_count}
+
+
+@app.post("/community/posts/{post_id}/bookmark")
+def toggle_community_bookmark(
+    post_id: int,
+    context=Depends(get_current_user_context),
+    db: Session = Depends(get_db),
+):
+    post = db.query(CommunityPost).filter(CommunityPost.id == post_id).first()
+    if not post:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"message": f"{post_id}의 게시글이 없습니다"},
+        )
+    existing = (
+        db.query(CommunityPostBookmark)
+        .filter(
+            CommunityPostBookmark.post_id == post_id,
+            CommunityPostBookmark.user_id == context["user"].id,
+        )
+        .first()
+    )
+    if existing:
+        db.delete(existing)
+        is_bookmarked = False
+    else:
+        db.add(
+            CommunityPostBookmark(
+                post_id=post_id,
+                user_id=context["user"].id,
+                created_at=datetime.utcnow(),
+            )
+        )
+        is_bookmarked = True
+    db.commit()
+    return {"post_id": post_id, "is_bookmarked": is_bookmarked}

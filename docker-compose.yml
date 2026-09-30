@@ -1,0 +1,93 @@
+##############################################
+# iSeed (아이씨드) - 통합 docker-compose
+#
+#   기본 실행 :  docker compose up --build
+#                → Frontend(3000) + AiModels(8080) + Backend(8000)
+#
+#   핵심 플로우(그림검사 → AI분석 → 리포트 → 마음활동 → 씨앗성장)는
+#   Frontend + AiModels 두 개만 살아있으면 동작합니다.
+#   Backend는 로그인/분석기록 저장용이며, 외부 DB가 없으면 자동으로
+#   해당 기능만 비활성화된 채 기동됩니다.
+##############################################
+
+services:
+  frontend:
+    build:
+      context: ./iSeed-Frontend-Docker
+      dockerfile: Dockerfile
+      args:
+        # NEXT_PUBLIC_* 는 빌드 시점에 번들에 박히므로 여기서 주입
+        - NEXT_PUBLIC_API_BASE_URL=http://${PUBLIC_HOST:-localhost}:${BACKEND_PORT:-8000}
+        - NEXT_PUBLIC_AIMODELS_BASE_URL=http://${PUBLIC_HOST:-localhost}:${AIMODELS_PORT:-8080}
+    container_name: iseed-frontend
+    ports:
+      - "${FRONTEND_PORT:-3000}:3000"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
+  aimodels:
+    build:
+      context: ./iSeed-AiModels-Docker
+      dockerfile: Dockerfile
+    container_name: iseed-aimodels
+    ports:
+      - "${AIMODELS_PORT:-8080}:8080"
+    env_file:
+      - ./iSeed-AiModels-Docker/.env
+    environment:
+      # RAG(ChromaDB) 경로 - 호스트 ./rag/chroma 가 마운트되는 위치
+      - HTP_DB_PATH=/app/rag/chroma
+      # 색인(init_rag.py)과 검색이 같은 임베딩 모델을 쓰도록 통일
+      - RAG_EMBEDDING_MODEL=${RAG_EMBEDDING_MODEL:-models/gemini-embedding-001}
+      # Gemini API 키는 env_file(./iSeed-AiModels-Docker/.env) 에서 읽습니다.
+      # (여기에 ${GEMINI_API_KEY:-} 로 적으면 루트 .env 에 값이 없을 때 빈 문자열로 덮어써져 키가 사라짐)
+    volumes:
+      # ChromaDB (RAG 지식베이스) - 호스트에서 직접 확인/재구축 가능
+      - ./rag/chroma:/app/rag/chroma
+      # 논문 원문 (재색인용, 읽기 전용)
+      - ./rag/papers:/app/rag/papers:ro
+      # 논문에서 추출한 HTP 지표 데이터셋 (ChromaDB 재구축용, 읽기 전용)
+      - ./rag/dataset:/app/rag/dataset:ro
+      # 분석 산출물 영구 보관
+      - aimodels-results:/app/jsonToLlm/results
+      - aimodels-uploads:/app/image_to_json/uploads
+      - aimodels-output:/app/image_to_json/result
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  backend:
+    build:
+      context: ./iSeed-Backend-Docker
+      dockerfile: Dockerfile
+    container_name: iseed-backend
+    ports:
+      - "${BACKEND_PORT:-8000}:8000"
+    env_file:
+      - ./iSeed-Backend-Docker/.env
+    environment:
+      - AIMODELS_BASE_URL=http://aimodels:8080
+      - FRONTEND_BASE_URL=http://${PUBLIC_HOST:-localhost}:${FRONTEND_PORT:-3000}
+      - KAKAO_REDIRECT_URI=http://${PUBLIC_HOST:-localhost}:${BACKEND_PORT:-8000}/auth/kakao/callback
+      - GOOGLE_REDIRECT_URI=http://${PUBLIC_HOST:-localhost}:${BACKEND_PORT:-8000}/auth/google/callback
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+volumes:
+  aimodels-results:
+  aimodels-uploads:
+  aimodels-output:

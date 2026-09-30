@@ -1,0 +1,19 @@
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.Python
+.git
+.gitignore
+*.md
+venv/
+.venv-local/
+env/
+ENV/
+.env
+# data/ 는 또래 비교 통계(label_stats_by_group.json)라 이미지에 포함합니다.
+chroma_db/
+chatbot/guide_chroma/
+image_to_json/uploads/
+image_to_json/result/
+jsonToLlm/results/

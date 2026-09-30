@@ -1,0 +1,54 @@
+# --- 환경/시크릿 (절대 커밋 금지) ---
+.env
+.env.*
+!.env.example
+
+# --- 의존성/빌드 산출물 ---
+node_modules/
+.next/
+__pycache__/
+*.py[cod]
+venv/
+.venv/
+.venv-local/
+
+# --- 분석 산출물 (런타임 생성) ---
+iSeed-AiModels-Docker/jsonToLlm/results/
+iSeed-AiModels-Docker/image_to_json/uploads/
+iSeed-AiModels-Docker/image_to_json/result/
+
+# --- RAG 백업 ---
+rag/chroma.bak/
+rag/**/*.bak
+
+# --- 로그/임시 ---
+*.log
+*.tmp
+*.temp
+
+# --- OS / IDE ---
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+
+# 로컬 테스트 계정
+*.local.json
+
+# --- 공개 저장소 제외 항목 ---
+# 학술 논문 원문 (저작권) - 논문은 각자 확보 후 rag/papers 에 넣으면 재색인 가능
+rag/papers/*.pdf
+rag/dataset/chunks/
+iSeed-AiModels-Docker/jsonToLlm/thesis/*.pdf
+# AI 허브 원천 데이터 샘플 (재배포 제한)
+iSeed-AiModels-Docker/image_to_json/test/
+docs/e2e-sample-run/
+# 실행에 쓰지 않는 중복 가중치 (image_to_json/*_weights 만 사용)
+iSeed-AiModels-Docker/weights/
+# 공모전 제출 초안
+docs/submission/
+# 로컬 도구 설정
+.claude/
+**/.claude/
+.local-pids.json
